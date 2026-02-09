@@ -1,13 +1,13 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Response, HTTPException
 from pydantic import BaseModel
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from bs4 import BeautifulSoup
+from PIL import Image, ImageDraw, ImageFont
+import io
 import time
-import re
 
 app = FastAPI()
 
@@ -15,177 +15,89 @@ class LoginData(BaseModel):
     username: str
     password: str
 
-# Допоміжна функція для очищення тексту
-def clean_text(text):
-    if not text:
-        return ""
-    return re.sub(r'\s+', ' ', text).strip()
-
-def parse_schedule_html(html_content, week_label):
-    soup = BeautifulSoup(html_content, 'html.parser')
-    schedule_data = []
-
-    # Знаходимо грід розкладу
-    # Орієнтуємось на класи, які були в JS скрипті: .schedule-grid
-    grid = soup.find(class_="schedule-grid")
-    if not grid:
-        return []
-
-    # Знаходимо заголовки днів (дати)
-    # Припускаємо, що це .grid-header-row або перший рядок
-    header_row = grid.find(class_="grid-header-row")
-    if not header_row:
-        # Fallback: можливо заголовки просто перші елементи
-        pass 
-
-    # Отримуємо дати для кожного стовпчика (крім першого - там час)
-    day_columns = []
-    if header_row:
-        cols = header_row.find_all("div", recursive=False) # Діти рядка
-        # Перший стовпчик - пустий або "Час", пропускаємо
-        for i, col in enumerate(cols[1:], 1): # Починаємо з 1
-            text = clean_text(col.get_text())
-            # Текст типу "Понеділок 23.10"
-            day_columns.append(text)
+def create_vertical_image(img1, img2):
+    padding, header_h = 40, 100
+    total_w = max(img1.width, img2.width) + (padding * 2)
+    total_h = header_h + img1.height + padding + header_h + img2.height + padding
     
-    # Якщо дат немає, створимо заглушки
-    if not day_columns:
-        day_columns = [f"День {i}" for i in range(1, 6)]
+    new_img = Image.new("RGB", (total_w, total_h), (255, 255, 255))
+    draw = ImageDraw.Draw(new_img)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 60)
+    except:
+        font = ImageFont.load_default()
 
-    # Ініціалізуємо структуру для кожного дня
-    days_map = {}
-    for day_name in day_columns:
-        days_map[day_name] = {
-            "day_name": day_name,
-            "date": week_label, # Можна витягнути з day_name пізніше
-            "lessons": []
-        }
+    # Малюємо заголовки
+    for i, txt in enumerate(["1 ТИЖДЕНЬ", "2 ТИЖДЕНЬ"]):
+        y = 20 if i == 0 else header_h + img1.height + padding + 20
+        img = img1 if i == 0 else img2
+        bbox = draw.textbbox((0, 0), txt, font=font)
+        draw.text(((total_w - (bbox[2]-bbox[0])) // 2, y), txt, fill=(0, 51, 153), font=font)
+        new_img.paste(img, ((total_w - img.width) // 2, y + 80))
+    return new_img
 
-    # Парсимо рядки з парами
-    rows = grid.find_all(class_="grid-row")
-    for row in rows:
-        cells = row.find_all("div", recursive=False)
-        if not cells:
-            continue
-
-        # Перша клітинка - номер пари і час
-        time_cell = cells[0]
-        time_text = clean_text(time_cell.get_text()) # "1 08:00 - 09:35"
-        
-        # Парсимо номер і час
-        lesson_number = 0
-        lesson_time = time_text
-        match = re.search(r'(\d+)\s*(.*)', time_text)
-        if match:
-            lesson_number = int(match.group(1))
-            lesson_time = match.group(2)
-
-        # Решта клітинок - предмети для кожного дня
-        # cells[1] -> Понеділок, cells[2] -> Вівторок...
-        for i, cell in enumerate(cells[1:]):
-            if i >= len(day_columns): break # Захист від виходу за межі
-            
-            day_name = day_columns[i]
-            
-            # Якщо клітинка пуста - пари немає
-            if not cell.get_text(strip=True):
-                continue
-            
-            # Витягуємо дані з клітинки
-            # Приклад структури в клітинці:
-            # <div class="subject">Math</div>
-            # <div class="teacher">Ivanov</div>
-            # <div class="room">101</div>
-            
-            subject = clean_text(cell.find(class_="discipline").get_text()) if cell.find(class_="discipline") else clean_text(cell.get_text())
-            teacher = clean_text(cell.find(class_="teacher").get_text()) if cell.find(class_="teacher") else ""
-            room = clean_text(cell.find(class_="auditory").get_text()) if cell.find(class_="auditory") else ""
-            lesson_type = clean_text(cell.find(class_="type").get_text()) if cell.find(class_="type") else ""
-            
-            # Посилання (Zoom/Google Meet)
-            link = None
-            a_tag = cell.find("a", href=True)
-            if a_tag:
-                link = a_tag['href']
-
-            lesson = {
-                "number": lesson_number,
-                "time": lesson_time,
-                "subject": subject,
-                "teacher": teacher,
-                "type": lesson_type,
-                "room": room,
-                "link": link
-            }
-            
-            days_map[day_name]["lessons"].append(lesson)
-
-    return list(days_map.values())
-
-@app.post("/api/schedule/json")
-def get_schedule_json(data: LoginData):
+@app.post("/generate-schedule")
+def generate_schedule(data: LoginData):
     options = webdriver.ChromeOptions()
-    # Оптимізація для Free Tier (Render/Heroku - 512MB RAM)
-    options.add_argument("--headless=new") # Новий безголовий режим (менше пам'яті)
+    options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--disable-infobars")
-    options.add_argument("--disable-notifications")
-    options.add_argument("--blink-settings=imagesEnabled=false") # Не завантажувати картинки (швидше!)
-    options.page_load_strategy = 'eager' # Не чекати повного завантаження ресурсів
-    
-    # Тільки якщо дуже мало пам'яті (може бути менш стабільним)
-    # options.add_argument("--single-process") 
+    options.add_argument("--window-size=1920,2500")
 
     driver = webdriver.Chrome(options=options)
-    wait = WebDriverWait(driver, 15) # Трохи збільшимо на всяк випадок
+    wait = WebDriverWait(driver, 25)
 
     try:
-        # Логін
+        # ЖОДНИХ print(data.username) ТУТ НЕМАЄ
         driver.get("https://cabinet.nau.edu.ua/login")
         wait.until(EC.presence_of_element_located((By.ID, "loginform-username"))).send_keys(data.username)
         driver.find_element(By.ID, "password-input").send_keys(data.password + Keys.ENTER)
 
-        time.sleep(2) # Чекаємо редірект
+        time.sleep(3)
         if "login" in driver.current_url:
-            raise HTTPException(status_code=401, detail="Authentication Failed")
+             raise Exception("Authentication Failed") # Універсальна помилка
 
         driver.get("https://cabinet.nau.edu.ua/student/schedule")
-        
-        # Чекаємо таблицю
         wait.until(EC.presence_of_element_located((By.CLASS_NAME, "schedule-grid")))
 
-        all_schedule = []
-
-        # -- Тиждень 1 --
-        # Натискаємо кнопку, якщо треба, але зазвичай 1 тиждень відкритий
-        # wait.until(EC.element_to_be_clickable((By.XPATH, "//a[contains(., '1 тиждень')]"))).click()
-        # time.sleep(1)
-        
-        # Парсимо HTML активної вкладки
-        html_tab0 = driver.find_element(By.CSS_SELECTOR, "#w0-tab0").get_attribute('innerHTML')
-        all_schedule.extend(parse_schedule_html(html_tab0, "1 тиждень"))
-
-        # -- Тиждень 2 --
-        # Перемикаємось на 2 тиждень
-        try:
-            tab2_btn = driver.find_element(By.XPATH, "//a[contains(., '2 тиждень')]")
-            driver.execute_script("arguments[0].click();", tab2_btn) # Клік через JS надійніший
-            time.sleep(1) # Чекаємо підвантаження
+        # Чистка інтерфейсу
+        driver.execute_script("""
+            var sidebar = document.querySelector('.menu-aside'); if(sidebar) sidebar.remove();
+            var navbar = document.querySelector('nav.navbar'); if(navbar) navbar.style.display = 'none';
+            var footer = document.querySelector('footer'); if(footer) footer.style.display = 'none';
+            var container = document.querySelector('.container');
+            if(container) { container.style.maxWidth = '100%'; container.style.width = '100%'; container.style.margin = '0'; }
             
-            # Чекаємо поки вкладка стане активною (не обов'язково, але бажано)
-            html_tab1 = driver.find_element(By.CSS_SELECTOR, "#w0-tab1").get_attribute('innerHTML')
-            all_schedule.extend(parse_schedule_html(html_tab1, "2 тиждень"))
-        except Exception as e:
-            print(f"Skipping week 2: {e}")
+            var style = document.createElement('style');
+            style.innerHTML = '.schedule-grid { grid-template-columns: 80px repeat(5, 1fr) !important; display: grid !important; width: 100% !important; }';
+            document.head.appendChild(style);
 
-        return all_schedule
+            document.querySelectorAll('.grid-header-row, .grid-row').forEach(row => {
+                if (row.children.length >= 7) { row.children[row.children.length-1].style.display = 'none'; } // Неділя
+                if (row.children.length >= 8) { row.children[row.children.length-2].style.display = 'none'; } // Субота
+            });
+        """)
+        time.sleep(2)
 
-    except Exception as e:
-        print(f"Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # Тиждень 1
+        wait.until(EC.element_to_be_clickable((By.XPATH, "//a[contains(., '1 тиждень')]"))).click()
+        time.sleep(2)
+        img1 = Image.open(io.BytesIO(driver.find_element(By.CSS_SELECTOR, "#w0-tab0 .schedule-grid").screenshot_as_png))
+
+        # Тиждень 2
+        driver.find_element(By.XPATH, "//a[contains(., '2 тиждень')]").click()
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "#w0-tab1.active")))
+        time.sleep(2)
+        img2 = Image.open(io.BytesIO(driver.find_element(By.CSS_SELECTOR, "#w0-tab1 .schedule-grid").screenshot_as_png))
+
+        final_img = create_vertical_image(img1, img2)
+        img_byte_arr = io.BytesIO()
+        final_img.save(img_byte_arr, format='PNG')
+        
+        return Response(content=img_byte_arr.getvalue(), media_type="image/png")
+
+    except Exception:
+        # Повертаємо загальну помилку без деталей про логін
+        raise HTTPException(status_code=400, detail="Error processing schedule")
     finally:
         driver.quit()
-
