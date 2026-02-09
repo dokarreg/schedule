@@ -1,21 +1,40 @@
-FROM python:3.9
+# Використовуємо офіційний Python образ (slim версія для меншого розміру)
+FROM python:3.9-slim
 
-# 1. Встановлюємо необхідні утиліти
-RUN apt-get update && apt-get install -y wget gnupg ca-certificates --no-install-recommends
+# Встановлюємо змінні оточення
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 
-# 2. Додаємо ключ Google Chrome (сучасний спосіб без apt-key)
-RUN wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
+# Встановлюємо системні залежності для Chrome та Selenium
+RUN apt-get update && apt-get install -y \
+    wget \
+    gnupg \
+    unzip \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
-# 3. Додаємо репозиторій, посилаючись на цей ключ
-RUN echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list
+# Встановлюємо Google Chrome Stable
+RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
+    && sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list' \
+    && apt-get update \
+    && apt-get install -y google-chrome-stable \
+    && rm -rf /var/lib/apt/lists/*
 
-# 4. Встановлюємо Chrome
-RUN apt-get update && apt-get install -y google-chrome-stable --no-install-recommends
-
-# Далі твій код без змін
+# Встановлюємо робочу директорію
 WORKDIR /app
+
+# Копіюємо файл залежностей та встановлюємо їх
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+# Копіюємо код програм
+# УВАГА: Ми перейменовуємо файл на main.py для зручності запуску
+COPY "main (7).py" main.py
+
+# Створюємо користувача non-root для безпеки (опціонально, але бажано для Render)
+RUN useradd -m myuser
+USER myuser
+
+# Запускаємо сервер
+# Render автоматично передає порт через змінну PORT
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
