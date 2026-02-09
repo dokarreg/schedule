@@ -125,12 +125,22 @@ def parse_schedule_html(html_content, week_label):
 @app.post("/api/schedule/json")
 def get_schedule_json(data: LoginData):
     options = webdriver.ChromeOptions()
-    options.add_argument("--headless=new")
+    # Оптимізація для Free Tier (Render/Heroku - 512MB RAM)
+    options.add_argument("--headless=new") # Новий безголовий режим (менше пам'яті)
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-infobars")
+    options.add_argument("--disable-notifications")
+    options.add_argument("--blink-settings=imagesEnabled=false") # Не завантажувати картинки (швидше!)
+    options.page_load_strategy = 'eager' # Не чекати повного завантаження ресурсів
     
+    # Тільки якщо дуже мало пам'яті (може бути менш стабільним)
+    # options.add_argument("--single-process") 
+
     driver = webdriver.Chrome(options=options)
-    wait = WebDriverWait(driver, 10) # Менший таймаут, щоб не висіло довго
+    wait = WebDriverWait(driver, 15) # Трохи збільшимо на всяк випадок
 
     try:
         # Логін
